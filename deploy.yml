@@ -1,0 +1,159 @@
+name: Build, Test, Push, and Deploy Nginx Website
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (staging|production)"
+        required: false
+        default: "production"
+
+env:
+  IMAGE_NAME: sumit/nginx-site
+  REGISTRY: docker.io
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set build metadata
+        id: meta
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          # If on staging branch, add -staging tag suffix
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            echo "TAG_SUFFIX=-staging" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_SUFFIX=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Docker build (with cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest${{ steps.meta.outputs.TAG_SUFFIX }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SHORT_SHA }}${{ steps.meta.outputs.TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Run container for tests
+        run: |
+          docker image ls
+          docker run -d --name site_test -p 8080:80 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest${{ steps.meta.outputs.TAG_SUFFIX }}
+          # Basic health: wait then curl
+          for i in {1..10}; do
+            sleep 2
+            if curl -fsS http://localhost:8080 > /dev/null; then
+              echo "Site responded OK"
+              exit 0
+            fi
+          done
+          echo "Site failed health check"
+          docker logs site_test || true
+          exit 1
+
+      - name: Validate Nginx config inside container
+        run: |
+          docker exec site_test nginx -t
+
+      - name: Optional content checks
+        run: |
+          curl -fsS http://localhost:8080 | grep -qi "fitness" || echo "Content check: 'fitness' not found (optional)"
+
+      - name: Stop test container
+        run: docker rm -f site_test
+
+      - name: Push image (latest + short SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest${{ steps.meta.outputs.TAG_SUFFIX }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SHORT_SHA }}${{ steps.meta.outputs.TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  deploy:
+    needs: build-test-push
+    runs-on: ubuntu-latest
+
+    # Gate deployments by branch (staging vs main)
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+
+    steps:
+      - name: Determine tag by branch
+        id: tag
+        run: |
+          if [ "${{ github.ref_name }}" = "staging" ]; then
+            echo "DEPLOY_TAG=latest-staging" >> $GITHUB_OUTPUT
+          else
+            echo "DEPLOY_TAG=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to remote Docker host via SSH
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            set -e
+            IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.DEPLOY_TAG }}"
+            CONTAINER_NAME="nginx_site"
+            PORT="8080"
+
+            echo "Pulling image: $IMAGE"
+            docker pull "$IMAGE"
+
+            echo "Creating backup container (rollback strategy)"
+            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+              docker rename "${CONTAINER_NAME}" "${CONTAINER_NAME}_backup_$(date +%s)" || true
+            fi
+
+            echo "Starting new container"
+            docker run -d --name "${CONTAINER_NAME}" -p ${PORT}:80 --restart always "$IMAGE"
+
+            echo "Smoke test on host"
+            for i in {1..10}; do
+              sleep 2
+              if curl -fsS http://localhost:${PORT} > /dev/null; then
+                echo "Deployment OK"
+                exit 0
+              fi
+            done
+
+            echo "Deployment failed — rolling back"
+            docker rm -f "${CONTAINER_NAME}" || true
+            # Find the most recent backup and restore (optional: track previous tag/version out-of-band)
+            LAST_BACKUP=$(docker ps -a --format '{{.Names}}' | grep "${CONTAINER_NAME}_backup_" | sort | tail -n 1 || true)
+            if [ -n "$LAST_BACKUP" ]; then
+              docker rename "$LAST_BACKUP" "${CONTAINER_NAME}" || true
+              docker start "${CONTAINER_NAME}" || true
+              echo "Rollback done"
+            else
+              echo "No backup container found"
+            fi
